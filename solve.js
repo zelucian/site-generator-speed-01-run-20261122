@@ -48,7 +48,6 @@ export const SLUG_MAX = 64;
  * the normalisation entirely.
  */
 export function slugify(text) {
-  let plain = text;
   let ascii = true;
   for (let i = 0; i < text.length; i++) {
     if (text.charCodeAt(i) >= 128) {
@@ -56,7 +55,19 @@ export function slugify(text) {
       break;
     }
   }
-  if (!ascii) plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
+  if (ascii) {
+    // Pure ASCII: NFKD changes nothing and there are no marks to drop, so the run-collapsing scan below
+    // is exactly: lower-case (A-Z only, which is all toLowerCase touches in ASCII), every run of
+    // non-[a-z0-9] as one "-", none leading, cut at SLUG_MAX, no "-" left at the end.
+    let out = text.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    if (out.charCodeAt(0) === 45) out = out.slice(1);
+    if (out.length > SLUG_MAX) out = out.slice(0, SLUG_MAX);
+    let end = out.length;
+    while (end > 0 && out.charCodeAt(end - 1) === 45) end--;
+    out = out.slice(0, end);
+    return out === '' ? 'untitled' : out;
+  }
+  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
   let out = '';
   let gap = false;
   for (let i = 0; i < plain.length; i++) {
@@ -298,7 +309,6 @@ export function parseFrontMatter(text) {
 const ESCAPABLE = new Uint8Array(128);
 for (const ch of ['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']) ESCAPABLE[ch.charCodeAt(0)] = 1;
 
-const INLINE_SPECIAL = /[\\`*\[]/;
 const WS_RE = /\s/;
 
 /** A fence's language, or null when `line` does not open one. */
@@ -391,49 +401,74 @@ function isContinued(line) {
   return j >= 2 && j < line.length && !isWSCode(line.charCodeAt(j));
 }
 
+/**
+ * Whether the character at `j` is escaped for a scan that starts at `from`: the backslashes directly
+ * before it, counted back no further than `from`, have odd length in that span. A run pairs up from
+ * where the scan meets it — each backslash but the last is followed by a backslash, which is escapable,
+ * and the last is followed by `s[j]`, which every caller asks about only when it is escapable too — so
+ * an odd span leaves its last backslash free to escape `s[j]`.
+ */
+function isEscapedAt(s, j, from) {
+  let run = 0;
+  for (let k = j - 1; k >= from && s.charCodeAt(k) === 92; k--) run++;
+  return run % 2 === 1;
+}
+
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s.charCodeAt(j) === 92 && j + 1 < s.length && ESCAPABLE[s.charCodeAt(j + 1)]) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  let j = from;
+  for (;;) {
+    j = s.indexOf(what, j);
+    if (j === -1) return -1;
+    if (!isEscapedAt(s, j, from)) return j;
+    j++;
   }
-  return -1;
 }
 
 /** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < s.length && ESCAPABLE[s.charCodeAt(j + 1)]) {
+  let j = from;
+  for (;;) {
+    j = s.indexOf('*', j);
+    if (j === -1) return -1;
+    if (isEscapedAt(s, j, from)) {
       j++;
       continue;
     }
-    if (c !== 42) continue;
     if (s.charCodeAt(j + 1) === 42) {
-      j++;
+      j += 2;
       continue;
     }
     return j;
   }
-  return -1;
 }
 
-/** `s` rendered inline; `link(target)` is a link's href. */
+const INLINE_SPECIAL_G = /[\\`*\[]/g;
+
+/**
+ * `s` rendered inline; `link(target)` is a link's href. The scan jumps from one special character to the
+ * next on the regex engine instead of stepping over every plain character in this loop; the plain runs
+ * between specials are escaped in bulk, and each special is decided exactly as a character-stepping scan
+ * would decide it (a failed special is stepped over, 1 or 2 characters, and stays part of the plain run).
+ */
 export function inline(s, link) {
-  if (!INLINE_SPECIAL.test(s)) return escapeHtml(s);
   let out = '';
   let i = 0;
   let plain = 0;
-  while (i < s.length) {
+  const n = s.length;
+  while (i < n) {
+    INLINE_SPECIAL_G.lastIndex = i;
+    const hit = INLINE_SPECIAL_G.exec(s);
+    if (hit === null) break;
+    i = hit.index;
     const c = s.charCodeAt(i);
-    if (c === 92 && i + 1 < s.length && ESCAPABLE[s.charCodeAt(i + 1)]) {
-      if (i > plain) out += escapeHtml(s.slice(plain, i));
-      out += escapeHtml(s[i + 1]);
-      i += 2;
-      plain = i;
+    if (c === 92) {
+      if (i + 1 < n && ESCAPABLE[s.charCodeAt(i + 1)]) {
+        if (i > plain) out += escapeHtml(s.slice(plain, i));
+        out += escapeHtml(s[i + 1]);
+        i += 2;
+        plain = i;
+      } else i++;
       continue;
     }
     if (c === 96) {
@@ -466,23 +501,18 @@ export function inline(s, link) {
       } else i++;
       continue;
     }
-    if (c === 91) {
-      const k = findUnescaped(s, ']', i + 1);
-      const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 ? '' : s.slice(k + 2, m);
-      if (target !== '' && !WS_RE.test(target)) {
-        if (i > plain) out += escapeHtml(s.slice(plain, i));
-        out += '<a href="' + escapeHtml(link(target)) + '">' + inline(s.slice(i + 1, k), link) + '</a>';
-        i = m + 1;
-        plain = i;
-        continue;
-      }
-      i++;
-      continue;
-    }
-    i++;
+    // c === 91, the only other character the scan can land on.
+    const k = findUnescaped(s, ']', i + 1);
+    const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
+    const target = m === -1 ? '' : s.slice(k + 2, m);
+    if (target !== '' && !WS_RE.test(target)) {
+      if (i > plain) out += escapeHtml(s.slice(plain, i));
+      out += '<a href="' + escapeHtml(link(target)) + '">' + inline(s.slice(i + 1, k), link) + '</a>';
+      i = m + 1;
+      plain = i;
+    } else i++;
   }
-  if (s.length > plain) out += escapeHtml(s.slice(plain, s.length));
+  if (n > plain) out += escapeHtml(s.slice(plain, n));
   return out;
 }
 
@@ -510,17 +540,16 @@ export function renderMarkdown(src, link) {
     } else if (c0 === 96) {
       const fence = fenceOpen(line);
       if (fence !== null) {
-        const body = [];
-        i++;
-        while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
         i++;
         let s = '<pre><code';
         if (fence !== '') s += ' class="language-' + escapeHtml(fence) + '"';
         s += '>';
-        for (let k = 0; k < body.length; k++) {
-          s += escapeHtml(body[k]);
+        while (i < n && !isFenceClose(lines[i])) {
+          s += escapeHtml(lines[i]);
           s += '\n';
+          i++;
         }
+        i++;
         s += '</code></pre>';
         blocks.push(s);
         continue;
@@ -550,34 +579,30 @@ export function renderMarkdown(src, link) {
           if (c === 45 || c === 42) {
             const m = bulletMatch(l);
             if (m !== null) {
-              items.push([trimLine(m)]);
+              items.push(trimLine(m));
               i++;
               continue;
             }
           }
           if (c === 32 && isContinued(l)) {
-            items[items.length - 1].push(trimLine(l));
+            items[items.length - 1] += '\n' + trimLine(l);
             i++;
           } else break;
         }
         let s = '<ul>\n';
-        for (let k = 0; k < items.length; k++) s += `<li>${inline(items[k].join('\n'), link)}</li>\n`;
+        for (let k = 0; k < items.length; k++) s += `<li>${inline(items[k], link)}</li>\n`;
         s += '</ul>';
         blocks.push(s);
         continue;
       }
     } else if (c0 === 62) {
-      const body = [];
+      let kept = '';
       while (i < n && lines[i].charCodeAt(0) === 62) {
         const l = lines[i++];
-        body.push(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
+        const t = trimLine(l.charCodeAt(1) === 32 ? l.slice(2) : l.slice(1));
+        if (t !== '') kept = kept === '' ? t : kept + '\n' + t;
       }
-      const kept = [];
-      for (let k = 0; k < body.length; k++) {
-        const t = trimLine(body[k]);
-        if (t !== '') kept.push(t);
-      }
-      blocks.push(kept.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(kept.join('\n'), link)}</p>\n</blockquote>`);
+      blocks.push(kept === '' ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(kept, link)}</p>\n</blockquote>`);
       continue;
     } else if (c0 >= 48 && c0 <= 57) {
       const ordered = orderedMatch(line);
@@ -589,28 +614,28 @@ export function renderMarkdown(src, link) {
           if (c >= 48 && c <= 57) {
             const m = orderedMatch(l);
             if (m !== null) {
-              items.push([trimLine(m[1])]);
+              items.push(trimLine(m[1]));
               i++;
               continue;
             }
           }
           if (c === 32 && isContinued(l)) {
-            items[items.length - 1].push(trimLine(l));
+            items[items.length - 1] += '\n' + trimLine(l);
             i++;
           } else break;
         }
         const start = Number(ordered[0]);
         let s = (start !== 1 ? `<ol start="${start}">` : '<ol>') + '\n';
-        for (let k = 0; k < items.length; k++) s += `<li>${inline(items[k].join('\n'), link)}</li>\n`;
+        for (let k = 0; k < items.length; k++) s += `<li>${inline(items[k], link)}</li>\n`;
         s += '</ol>';
         blocks.push(s);
         continue;
       }
     }
-    const body = [trimLine(line)];
+    let text = trimLine(line);
     i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const html = inline(body.join('\n'), link);
+    while (i < n && !endsParagraph(lines[i])) text += '\n' + trimLine(lines[i++]);
+    const html = inline(text, link);
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
